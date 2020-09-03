@@ -1,0 +1,245 @@
+# Author: Nathan Duckett
+
+stages:
+  - Build
+  - DocsCheck
+  - StaticAnalysis
+  - UnitTests
+  - IntegrationTests
+  - DeployPages
+  - BuildPackage
+
+# Define script to build keys.json file.
+.build_keys: &build_keys
+  - |
+    cat > src/main/resources/keys.json << EOF
+    {
+      "weather": $weather_api_key,
+      "maps": $map_api_key
+    }
+    EOF
+
+.build_windows_keys: &build_windows_keys
+  - |
+    $KeysContent = @{
+      weather=$env:weather_api_key
+      maps=$env:map_api_key
+    }
+  - $KeysContent | ConvertTo-Json | Set-Content ./src/main/resources/keys.json
+
+# Define only includes for code changes reference.
+.define_only_includes: &define_only_includes
+  only:
+    refs:
+      - merge_requests
+      - branches
+      - tags
+    changes:
+      - src/**/*
+      - pom.xml
+      - .gitlab-ci.yml
+
+# Storage of common variables between stages
+variables:
+  GUI_HEADLESS_TESTS: "-Djava.awt.headless=true -Dtestfx.robot=glass -Dtestfx.headless=true -Dprism.order=sw"
+  # This prefix will skip GUI tests
+  NO_GUI_TEST: "-DexcludePackage=nz.ac.vuw.engr300.gui.**"
+
+build:
+  stage: Build
+  tags:
+    - shell
+  script:
+    - mvn compile
+  allow_failure: false
+  <<: *define_only_includes
+  needs: []
+
+# Must verify javadoc in test phase incase it fails during deploy pages.
+verify_javadoc:
+  stage: DocsCheck
+  tags:
+    - shell
+  script:
+    - mvn javadoc:javadoc
+  allow_failure: false
+  <<: *define_only_includes
+  needs: []
+
+spell_check:
+  stage: DocsCheck
+  tags:
+    - shell
+  script:
+    - npm install markdown-spellcheck
+    - ./node_modules/markdown-spellcheck/bin/mdspell -r -n -a '**/*.md' '!**/node_modules/**/*.md'
+  allow_failure: false
+  # Must manually write only-changes to change on documents only.
+  only:
+    refs:
+      - merge_requests
+      - branches
+      - tags
+    changes:
+      - "**/*.md"
+      - .spelling
+      - .gitlab-ci.yml
+  needs: []
+
+find_bugs:
+  stage: StaticAnalysis
+  tags:
+    - shell
+  script:
+    - mvn clean compile spotbugs:check
+  <<: *define_only_includes
+  needs: ["build"]
+
+checkstyle:
+  stage: StaticAnalysis
+  tags:
+    - shell
+  script:
+    - wget https://github.com/checkstyle/checkstyle/releases/download/checkstyle-8.32/checkstyle-8.32-all.jar
+    - result=$(java -jar checkstyle-8.32-all.jar -c checkstyle.xml src/)
+    # Cleanup following running checkstyle
+    - rm checkstyle-8.32-all.jar
+    # Define passing result
+    - expected_result="Starting audit...Audit done."
+    # Check actual matches expected - Need to alias results to remove newlines for comparison
+    # Without the stripping of newlines it can't compare the results.
+    - |
+      test_res=${result//$'\n'/}
+      if [ "$test_res" != "$expected_result" ]; then
+        >&2 echo "Checkstyle has Failed"
+        echo "$result" | while IFS= read -r line; do
+          echo "$line"
+        done
+        $(exit 1)
+      fi
+  allow_failure: false
+  # Must manually write only-changes to allow checkystyle.xml updates.
+  only:
+    refs:
+    - branches
+    - merge_requests
+    - tags
+    changes:
+      - src/**/*
+      - pom.xml
+      - .gitlab-ci.yml
+      - checkstyle.xml
+  needs: []
+        
+unittest:
+  stage: UnitTests
+  tags:
+    - nathan
+    - linux
+  before_script:
+    - *build_keys
+  script:
+    - mvn clean test $NO_GUI_TEST
+  allow_failure: false
+  <<: *define_only_includes
+  needs: ["build"]
+
+unittest_windows:
+  stage: UnitTests
+  tags:
+    - nathan
+    - windows
+  before_script:
+    - *build_windows_keys
+  script:
+    - mvn $NO_GUI_TEST clean test
+  <<: *define_only_includes
+  needs: ["build"]
+
+# Runs both unit and integration tests for coverage.
+full_tests:
+  stage: IntegrationTests
+  tags:
+    - nathan
+    - linux
+  before_script:
+    - *build_keys
+  dependencies:
+    - unittest
+  script:
+    - DISPLAY=:0 mvn clean test
+    - cat target/site/jacoco/index.html
+  allow_failure: false
+  artifacts:
+    paths:
+      - target/site/jacoco/
+  <<: *define_only_includes
+  needs: ["build", "unittest"]
+
+pages:
+  stage: DeployPages
+  # Run this stage only on the master branch.
+  only:
+    refs:
+      - master
+    changes:
+      - src/**/*
+      - pom.xml
+      - .gitlab-ci.yml
+  tags:
+    - shell
+  dependencies:
+    - full_tests
+  script:
+    # First transfer generated testcoverage
+    - mkdir public
+    - mv target/site/jacoco public/jacoco/
+    # Generate javadoc and move to site after
+    - mvn javadoc:javadoc
+    - mv target/site/apidocs public/javadoc/
+  artifacts:
+    paths:
+      - public
+  # Can only work if full_tests is run (access artifacts) and if javadocs are valid.
+  needs: ["full_tests", "verify_javadoc"]
+
+##
+## NOTE: ALL packaging skips GUI tests as they rely on tests passing first
+## This is for stability purposes.
+##
+
+package:
+  stage: BuildPackage
+  tags:
+    - nathan
+    - linux
+  before_script:
+    - *build_keys
+  dependencies:
+    - unittest
+  script:
+    - mvn $NO_GUI_TEST clean package
+  artifacts:
+    paths:
+      # Only add the full mission-control jar wildcard the version
+      - target/mission-control-*.jar
+  <<: *define_only_includes
+  needs: ["unittest"]
+
+package_windows:
+  stage: BuildPackage
+  tags:
+    - nathan
+    - windows
+  before_script:
+    - *build_windows_keys
+  dependencies:
+    - unittest_windows
+  script:
+    - mvn $NO_GUI_TEST clean package
+  artifacts:
+    paths:
+      # Only add the full mission-control jar wildcard the version
+      - ./target/mission-control-*.jar
+  <<: *define_only_includes
+  needs: ["unittest_windows"]
